@@ -628,8 +628,10 @@ export class ARRenderer extends EventDispatcher {
         this.isTwoFingering = false;
       } else {
         const {separation, deltaYaw} = this.fingerPolar(fingers);
-        this.isRotating = Math.abs(deltaYaw) > ROTATION_THRESHOLD;
-        if (!this.isRotating && !this.isScaling) {
+        if (Math.abs(deltaYaw) > ROTATION_THRESHOLD) {
+          this.isScaling = false;
+          this.isRotating = true;
+        } else if (!this.isScaling) {
           this.isScaling = true;
           this.firstRatio = separation / scene.scale.x;
         }
