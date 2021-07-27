@@ -33,6 +33,7 @@ const INIT_FRAMES = 30;
 // estimation, which will be used once available in WebXR.
 const AR_SHADOW_INTENSITY = 0.3;
 const ROTATION_RATE = 1.5;
+const ROTATION_THRESHOLD = 0.05;
 // Angle down (towards bottom of screen) from camera center ray to use for hit
 // testing against the floor. This makes placement faster and more intuitive
 // assuming the phone is in portrait mode. This seems to be a reasonable
@@ -78,9 +79,9 @@ const hitPosition = new Vector3();
 const camera = new PerspectiveCamera(45, 1, 0.1, 100);
 
 export class ARRenderer extends EventDispatcher {
-  public threeRenderer: WebGLRenderer;
-  public currentSession: XRSession|null = null;
-  public placeOnWall = false;
+  threeRenderer: WebGLRenderer;
+  currentSession: XRSession|null = null;
+  placeOnWall = false;
 
   private placementBox: PlacementBox|null = null;
   private lastTick: number|null = null;
@@ -107,6 +108,7 @@ export class ARRenderer extends EventDispatcher {
   private placementComplete = false;
   private isTranslating = false;
   private isRotating = false;
+  private isScaling = false;
   private isTwoFingering = false;
   private lastDragPosition = new Vector3();
   private firstRatio = 0;
@@ -472,19 +474,20 @@ export class ARRenderer extends EventDispatcher {
     session.addEventListener('selectend', this.onSelectEnd);
     session
         .requestHitTestSourceForTransientInput({profile: 'generic-touchscreen'})
-        .then(hitTestSource => {
+        .then((hitTestSource) => {
           this.transientHitTestSource = hitTestSource;
         });
   }
 
   private getTouchLocation(): Vector3|null {
     const {axes} = this.inputSource!.gamepad;
-    let location = this.placementBox!.getExpandedHit(
+    const location = this.placementBox!.getExpandedHit(
         this.presentedScene!, axes[0], axes[1]);
     if (location != null) {
       vector3.copy(location).sub(this.presentedScene!.getCamera().position);
-      if (vector3.length() > MAX_DISTANCE)
+      if (vector3.length() > MAX_DISTANCE) {
         return null;
+      }
     }
     return location;
   }
@@ -509,7 +512,7 @@ export class ARRenderer extends EventDispatcher {
         null;
   }
 
-  public moveToFloor(frame: XRFrame) {
+  moveToFloor(frame: XRFrame) {
     const hitSource = this.initialHitSource;
     if (hitSource == null) {
       return;
@@ -577,11 +580,12 @@ export class ARRenderer extends EventDispatcher {
   private onSelectEnd = () => {
     this.isTranslating = false;
     this.isRotating = false;
+    this.isScaling = false;
     this.isTwoFingering = false;
     this.inputSource = null;
     this.goalPosition.y +=
         this.placementBox!.offsetHeight * this.presentedScene!.scale.x;
-    this.placementBox!.show = false
+    this.placementBox!.show = false;
   };
 
   private fingerPolar(fingers: XRTransientInputHitTestResult[]):
@@ -625,10 +629,15 @@ export class ARRenderer extends EventDispatcher {
         this.isTwoFingering = false;
       } else {
         const {separation, deltaYaw} = this.fingerPolar(fingers);
-        if (this.placeOnWall === false) {
+        this.isRotating = Math.abs(deltaYaw) > ROTATION_THRESHOLD;
+        if (!this.isRotating && !this.isScaling) {
+          this.isScaling = true;
+          this.firstRatio = separation / scene.scale.x;
+        }
+        if (this.placeOnWall === false && this.isRotating) {
           this.goalYaw += deltaYaw;
         }
-        if (scene.canScale) {
+        if (scene.canScale && this.isScaling) {
           const scale = separation / this.firstRatio;
           this.goalScale =
               (scale < SCALE_SNAP_HIGH && scale > SCALE_SNAP_LOW) ? 1 : scale;
@@ -725,7 +734,7 @@ export class ARRenderer extends EventDispatcher {
   /**
    * Only public to make it testable.
    */
-  public onWebXRFrame(time: number, frame: XRFrame) {
+  onWebXRFrame(time: number, frame: XRFrame) {
     this.frame = frame;
     ++this.frames;
     const refSpace = this.threeRenderer.xr.getReferenceSpace()!;
@@ -751,7 +760,7 @@ export class ARRenderer extends EventDispatcher {
     // isn't really supported at this point, but make a best-effort
     // attempt to render other views also, using the first view
     // as the main viewpoint.
-    let isFirstView: boolean = true;
+    let isFirstView = true;
     for (const view of pose.views) {
       this.updateView(view);
 
