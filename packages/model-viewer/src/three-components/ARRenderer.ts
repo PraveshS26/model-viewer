@@ -79,9 +79,9 @@ const hitPosition = new Vector3();
 const camera = new PerspectiveCamera(45, 1, 0.1, 100);
 
 export class ARRenderer extends EventDispatcher {
-  threeRenderer: WebGLRenderer;
-  currentSession: XRSession|null = null;
-  placeOnWall = false;
+  public threeRenderer: WebGLRenderer;
+  public currentSession: XRSession|null = null;
+  public placeOnWall = false;
 
   private placementBox: PlacementBox|null = null;
   private lastTick: number|null = null;
@@ -474,20 +474,19 @@ export class ARRenderer extends EventDispatcher {
     session.addEventListener('selectend', this.onSelectEnd);
     session
         .requestHitTestSourceForTransientInput({profile: 'generic-touchscreen'})
-        .then((hitTestSource) => {
+        .then(hitTestSource => {
           this.transientHitTestSource = hitTestSource;
         });
   }
 
   private getTouchLocation(): Vector3|null {
     const {axes} = this.inputSource!.gamepad;
-    const location = this.placementBox!.getExpandedHit(
+    let location = this.placementBox!.getExpandedHit(
         this.presentedScene!, axes[0], axes[1]);
     if (location != null) {
       vector3.copy(location).sub(this.presentedScene!.getCamera().position);
-      if (vector3.length() > MAX_DISTANCE) {
+      if (vector3.length() > MAX_DISTANCE)
         return null;
-      }
     }
     return location;
   }
@@ -512,7 +511,7 @@ export class ARRenderer extends EventDispatcher {
         null;
   }
 
-  moveToFloor(frame: XRFrame) {
+  public moveToPlane(frame: XRFrame) {
     const hitSource = this.initialHitSource;
     if (hitSource == null) {
       return;
@@ -734,7 +733,7 @@ export class ARRenderer extends EventDispatcher {
   /**
    * Only public to make it testable.
    */
-  onWebXRFrame(time: number, frame: XRFrame) {
+  public onWebXRFrame(time: number, frame: XRFrame) {
     this.frame = frame;
     ++this.frames;
     const refSpace = this.threeRenderer.xr.getReferenceSpace()!;
@@ -760,12 +759,12 @@ export class ARRenderer extends EventDispatcher {
     // isn't really supported at this point, but make a best-effort
     // attempt to render other views also, using the first view
     // as the main viewpoint.
-    let isFirstView = true;
+    let isFirstView: boolean = true;
     for (const view of pose.views) {
       this.updateView(view);
 
       if (isFirstView) {
-        this.moveToFloor(frame);
+        this.moveToPlane(frame);
 
         this.processInput(frame);
 
