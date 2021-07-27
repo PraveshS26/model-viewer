@@ -571,8 +571,6 @@ export class ARRenderer extends EventDispatcher {
     } else if (fingers.length === 2) {
       box.show = true;
       this.isTwoFingering = true;
-      const {separation} = this.fingerPolar(fingers);
-      this.firstRatio = separation / scene.scale.x;
     }
   };
 
@@ -650,6 +648,7 @@ export class ARRenderer extends EventDispatcher {
       // to scaling instead.
       this.isTranslating = false;
       this.isRotating = false;
+      this.isScaling = true;
       this.isTwoFingering = true;
       const {separation} = this.fingerPolar(fingers);
       this.firstRatio = separation / scale;
