@@ -13,7 +13,9 @@
  * limitations under the License.
  */
 
-import {Event as ThreeEvent, EventDispatcher, Matrix4, PerspectiveCamera, Vector3, WebGLRenderer} from 'three';
+import {BufferGeometry, Event as ThreeEvent, EventDispatcher, Line, Matrix4, PerspectiveCamera, Quaternion, Vector3, WebGLRenderer, XRControllerEventType, XRTargetRaySpace} from 'three';
+// import {XRControllerModelFactory} from
+// 'three/examples/jsm/webxr/XRControllerModelFactory.js';
 import {XREstimatedLight} from 'three/examples/jsm/webxr/XREstimatedLight.js';
 
 import {CameraChangeDetails, ControlsInterface} from '../features/controls.js';
@@ -46,6 +48,8 @@ const SCALE_SNAP_LOW = 1 / SCALE_SNAP_HIGH;
 const MIN_VIEWPORT_SCALE = 0.25;
 // Furthest away you can move an object (meters).
 const MAX_DISTANCE = 10;
+// Damper decay in milliseconds.
+const DECAY = 150;
 
 export type ARStatus =
     'not-presenting'|'session-started'|'object-placed'|'failed';
@@ -72,10 +76,17 @@ export interface ARTrackingEvent extends ThreeEvent {
   status: ARTracking,
 }
 
+interface XRControllerEvent {
+  type: XRControllerEventType, data: XRInputSource, target: XRTargetRaySpace
+}
+
 const vector3 = new Vector3();
+const quaternion = new Quaternion();
 const matrix4 = new Matrix4();
 const hitPosition = new Vector3();
 const camera = new PerspectiveCamera(45, 1, 0.1, 100);
+const lineGeometry = new BufferGeometry().setFromPoints(
+    [new Vector3(0, 0, 0), new Vector3(0, 0, -1)]);
 
 export class ARRenderer extends EventDispatcher<
     {status: {status: ARStatus}, tracking: {status: ARTracking}}> {
@@ -88,6 +99,7 @@ export class ARRenderer extends EventDispatcher<
   private turntableRotation: number|null = null;
   private oldShadowIntensity: number|null = null;
   private frame: XRFrame|null = null;
+  private viewerRefSpace: XRReferenceSpace|XRBoundedReferenceSpace|null = null;
   private initialHitSource: XRHitTestSource|null = null;
   private transientHitTestSource: XRTransientInputHitTestSource|null = null;
   private inputSource: XRInputSource|null = null;
@@ -96,6 +108,12 @@ export class ARRenderer extends EventDispatcher<
   private exitWebXRButtonContainer: HTMLElement|null = null;
   private overlay: HTMLElement|null = null;
   private xrLight: XREstimatedLight|null = null;
+  private xrMode: 'screen-space'|'world-space'|null = null;
+  private controller1: XRTargetRaySpace|null = null;
+  private controller2: XRTargetRaySpace|null = null;
+  // private controllerGrip1: XRTargetRaySpace|null = null;
+  // private controllerGrip2: XRTargetRaySpace|null = null;
+  private selectedController: XRTargetRaySpace|null = null;
 
   private tracking = true;
   private frames = 0;
@@ -115,6 +133,8 @@ export class ARRenderer extends EventDispatcher<
   private yDamper = new Damper();
   private zDamper = new Damper();
   private yawDamper = new Damper();
+  private pitchDamper = new Damper();
+  private rollDamper = new Damper();
   private scaleDamper = new Damper();
 
   private onExitWebXRButtonContainerClick = () => this.stopPresenting();
@@ -216,7 +236,9 @@ export class ARRenderer extends EventDispatcher<
     exitButton.addEventListener('click', this.onExitWebXRButtonContainerClick);
     this.exitWebXRButtonContainer = exitButton;
 
-    const viewerRefSpace = await currentSession.requestReferenceSpace('viewer');
+    this.viewerRefSpace = await currentSession.requestReferenceSpace('viewer');
+
+    this.xrMode = (currentSession as any).interactionMode;
 
     this.tracking = true;
     this.frames = 0;
@@ -235,17 +257,29 @@ export class ARRenderer extends EventDispatcher<
 
     scene.element.addEventListener('load', this.onUpdateScene);
 
-    const radians = HIT_ANGLE_DEG * Math.PI / 180;
-    const ray = this.placeOnWall === true ?
-        undefined :
-        new XRRay(
-            new DOMPoint(0, 0, 0),
-            {x: 0, y: -Math.sin(radians), z: -Math.cos(radians)});
-    currentSession
-        .requestHitTestSource!
-        ({space: viewerRefSpace, offsetRay: ray})!.then(hitTestSource => {
-          this.initialHitSource = hitTestSource;
-        });
+    if (this.xrMode === 'screen-space') {
+      const radians = HIT_ANGLE_DEG * Math.PI / 180;
+      const ray = this.placeOnWall === true ?
+          undefined :
+          new XRRay(
+              new DOMPoint(0, 0, 0),
+              {x: 0, y: -Math.sin(radians), z: -Math.cos(radians)});
+      currentSession
+          .requestHitTestSource!
+          ({space: this.viewerRefSpace, offsetRay: ray})!.then(
+              hitTestSource => {
+                this.initialHitSource = hitTestSource;
+              });
+    } else {
+      this.setupControllers();
+      this.xDamper.setDecayTime(DECAY);
+      this.yDamper.setDecayTime(DECAY);
+      this.zDamper.setDecayTime(DECAY);
+      this.yawDamper.setDecayTime(DECAY);
+      this.pitchDamper.setDecayTime(DECAY);
+      this.rollDamper.setDecayTime(DECAY);
+      this.scaleDamper.setDecayTime(DECAY);
+    }
 
     this.currentSession = currentSession;
     this.placementBox =
@@ -254,6 +288,86 @@ export class ARRenderer extends EventDispatcher<
 
     this.lastTick = performance.now();
     this.dispatchEvent({type: 'status', status: ARStatus.SESSION_STARTED});
+  }
+
+  private setupControllers() {
+    this.controller1 = this.threeRenderer.xr.getController(0);
+    this.controller1.addEventListener(
+        'selectstart',
+        (e: XRControllerEvent) => this.onControllerSelectStart(e));
+    this.controller1.addEventListener(
+        'selectend', (e: XRControllerEvent) => this.onControllerSelectEnd(e));
+
+    this.controller2 = this.threeRenderer.xr.getController(1);
+    this.controller2.addEventListener(
+        'selectstart',
+        (e: XRControllerEvent) => this.onControllerSelectStart(e));
+    this.controller2.addEventListener(
+        'selectend', (e: XRControllerEvent) => this.onControllerSelectEnd(e));
+
+    // const controllerModelFactory = new XRControllerModelFactory();
+
+    // this.controllerGrip1 = this.threeRenderer.xr.getControllerGrip(0);
+    // this.controllerGrip1.add(
+    //     controllerModelFactory.createControllerModel(this.controllerGrip1));
+
+    // this.controllerGrip2 = this.threeRenderer.xr.getControllerGrip(1);
+    // this.controllerGrip2.add(
+    //     controllerModelFactory.createControllerModel(this.controllerGrip2));
+
+    const line = new Line(lineGeometry);
+    line.name = 'line';
+    line.scale.z = 5;
+
+    this.controller1.add(line);
+    this.controller2.add(line.clone());
+
+    const scene = this.presentedScene!;
+    scene.add(this.controller1);
+    scene.add(this.controller2);
+    // scene.add(this.controllerGrip1);
+    // scene.add(this.controllerGrip2);
+  }
+
+  private hover(controller: XRTargetRaySpace) {
+    // Do not highlight in mobile-ar
+    if (this.xrMode === 'screen-space' ||
+        this.selectedController == controller) {
+      return false;
+    }
+
+    const scene = this.presentedScene!;
+    const line = controller.getObjectByName('line')!;
+    const intersection =
+        this.placementBox!.controllerIntersection(scene, controller)
+    line.scale.z = intersection == null ? 5 : intersection.distance;
+    return intersection != null;
+  }
+
+  private onControllerSelectStart(event: XRControllerEvent) {
+    const scene = this.presentedScene!;
+    const controller = event.target;
+
+    if (this.placementBox!.controllerIntersection(scene, controller) != null) {
+      controller.attach(scene.pivot);
+      this.selectedController = controller;
+      this.placementBox!.show = false;
+      scene.setShadowIntensity(0.01);
+    }
+  }
+
+  private onControllerSelectEnd(event: XRControllerEvent) {
+    if (event.target != this.selectedController) {
+      return;
+    }
+    const scene = this.presentedScene!;
+    // drop on floor
+    scene.attach(scene.pivot);
+    this.selectedController = null;
+    this.goalYaw = Math.atan2(
+        scene.pivot.matrix.elements[8], scene.pivot.matrix.elements[10]);
+    this.goalPosition.x = scene.pivot.position.x;
+    this.goalPosition.z = scene.pivot.position.z;
   }
 
   /**
@@ -334,8 +448,8 @@ export class ARRenderer extends EventDispatcher<
         this.xrLight = null;
       }
 
-      scene.position.set(0, 0, 0);
-      scene.scale.set(1, 1, 1);
+      scene.pivot.position.set(0, 0, 0);
+      scene.pivot.scale.set(1, 1, 1);
       scene.setShadowOffset(0);
       const yaw = this.turntableRotation;
       if (yaw != null) {
@@ -392,6 +506,13 @@ export class ARRenderer extends EventDispatcher<
       this.placementBox = null;
     }
 
+    if (this.xrMode !== 'screen-space') {
+      this.controller1?.removeFromParent();
+      this.controller2?.removeFromParent();
+      this.controller1 = null;
+      this.controller2 = null;
+    }
+
     this.lastTick = null;
     this.turntableRotation = null;
     this.oldShadowIntensity = null;
@@ -437,7 +558,8 @@ export class ARRenderer extends EventDispatcher<
 
   private placeInitially() {
     const scene = this.presentedScene!;
-    const {position, element} = scene;
+    const {pivot, element} = scene;
+    const {position} = pivot;
     const xrCamera = scene.getCamera();
 
     const {width, height} = this.overlay!.getBoundingClientRect();
@@ -445,14 +567,15 @@ export class ARRenderer extends EventDispatcher<
 
     xrCamera.projectionMatrixInverse.copy(xrCamera.projectionMatrix).invert();
 
-    const {theta, radius} =
-        (element as ModelViewerElementBase & ControlsInterface)
-            .getCameraOrbit();
+    const {theta} = (element as ModelViewerElementBase & ControlsInterface)
+                        .getCameraOrbit();
+
     // Orient model to match the 3D camera view
     const cameraDirection = xrCamera.getWorldDirection(vector3);
     scene.yaw = Math.atan2(-cameraDirection.x, -cameraDirection.z) - theta;
     this.goalYaw = scene.yaw;
 
+    const radius = Math.max(1, 2 * scene.boundingSphere.radius);
     position.copy(xrCamera.position)
         .add(cameraDirection.multiplyScalar(radius));
 
@@ -464,14 +587,24 @@ export class ARRenderer extends EventDispatcher<
 
     scene.setHotspotsVisibility(true);
 
-    const {session} = this.frame!;
-    session.addEventListener('selectstart', this.onSelectStart);
-    session.addEventListener('selectend', this.onSelectEnd);
-    session
-        .requestHitTestSourceForTransientInput!
-        ({profile: 'generic-touchscreen'})!.then(hitTestSource => {
-          this.transientHitTestSource = hitTestSource;
-        });
+    if (this.xrMode === 'screen-space') {
+      const {session} = this.frame!;
+      session.addEventListener('selectstart', this.onSelectStart);
+      session.addEventListener('selectend', this.onSelectEnd);
+      session
+          .requestHitTestSourceForTransientInput!
+          ({profile: 'generic-touchscreen'})!.then(hitTestSource => {
+            this.transientHitTestSource = hitTestSource;
+          });
+    } else {
+      const ray = new XRRay(position, {x: 0, y: -1, z: 0});
+      this.currentSession!
+          .requestHitTestSource!
+          ({space: this.viewerRefSpace!, offsetRay: ray})!.then(
+              hitTestSource => {
+                this.initialHitSource = hitTestSource;
+              });
+    }
   }
 
   private getTouchLocation(): Vector3|null {
@@ -524,7 +657,6 @@ export class ARRenderer extends EventDispatcher<
     }
 
     this.placementBox!.show = true;
-
     // If the user is translating, let the finger hit-ray take precedence and
     // ignore this hit result.
     if (!this.isTranslating) {
@@ -567,7 +699,7 @@ export class ARRenderer extends EventDispatcher<
       box.show = true;
       this.isTwoFingering = true;
       const {separation} = this.fingerPolar(fingers);
-      this.firstRatio = separation / scene.scale.x;
+      this.firstRatio = separation / scene.pivot.scale.x;
     }
   };
 
@@ -611,7 +743,7 @@ export class ARRenderer extends EventDispatcher<
     }
     const fingers = frame.getHitTestResultsForTransientInput(hitSource);
     const scene = this.presentedScene!;
-    const scale = scene.scale.x;
+    const scale = scene.pivot.scale.x;
 
     // Rotating, translating and scaling are mutually exclusive operations; only
     // one can happen at a time, but we can switch during a gesture.
@@ -689,11 +821,17 @@ export class ARRenderer extends EventDispatcher<
 
   private moveScene(delta: number) {
     const scene = this.presentedScene!;
-    const {position, yaw} = scene;
+    const {pivot} = scene;
+    const box = this.placementBox!;
+    box.updateOpacity(delta);
+    if (pivot.parent !== scene) {
+      return;  // attached to controller instead
+    }
+    const {position} = pivot;
     const boundingRadius = scene.boundingSphere.radius;
     const goal = this.goalPosition;
-    const oldScale = scene.scale.x;
-    const box = this.placementBox!;
+    const oldScale = scene.pivot.scale.x;
+
     let source = ChangeSource.NONE;
 
     if (!goal.equals(position) || this.goalScale !== oldScale) {
@@ -706,9 +844,9 @@ export class ARRenderer extends EventDispatcher<
 
       const newScale =
           this.scaleDamper.update(oldScale, this.goalScale, delta, 1);
-      scene.scale.set(newScale, newScale, newScale);
+      scene.pivot.scale.set(newScale, newScale, newScale);
 
-      if (!this.isTranslating) {
+      if (this.xrMode === 'screen-space' && !this.isTranslating) {
         const offset = goal.y - y;
         if (this.placementComplete && this.placeOnWall === false) {
           box.offsetHeight = offset / newScale;
@@ -719,11 +857,16 @@ export class ARRenderer extends EventDispatcher<
           scene.setShadowIntensity(AR_SHADOW_INTENSITY);
         }
       }
+      if (this.xrMode !== 'screen-space' && goal.equals(position)) {
+        scene.setShadowIntensity(AR_SHADOW_INTENSITY);
+      }
     }
-    box.updateOpacity(delta);
     scene.updateTarget(delta);
     // yaw must be updated last, since this also updates the shadow position.
-    scene.yaw = this.yawDamper.update(yaw, this.goalYaw, delta, Math.PI);
+    quaternion.setFromAxisAngle(vector3.set(0, 1, 0), this.goalYaw);
+    const angle = scene.pivot.quaternion.angleTo(quaternion);
+    const angleStep = angle - this.yawDamper.update(angle, 0, delta, Math.PI);
+    scene.pivot.quaternion.rotateTowards(quaternion, angleStep);
     // camera changes on every frame - user-interaction only if touching the
     // screen, plus damping time.
     scene.element.dispatchEvent(new CustomEvent<CameraChangeDetails>(
@@ -734,6 +877,12 @@ export class ARRenderer extends EventDispatcher<
    * Only public to make it testable.
    */
   public onWebXRFrame(time: number, frame: XRFrame) {
+    if (this.xrMode !== 'screen-space') {
+      const over1 = this.hover(this.controller1!);
+      const over2 = this.hover(this.controller2!);
+      this.placementBox!.show = over1 || over2;
+    }
+
     this.frame = frame;
     ++this.frames;
     const refSpace = this.threeRenderer.xr.getReferenceSpace()!;
